@@ -1,0 +1,21 @@
+# Auth cache
+*.json
+!package.json
+auth.json
+
+# Browser profiles
+browser-profile/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+/tmp/
+*.sqlite
