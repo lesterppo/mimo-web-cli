@@ -65,8 +65,19 @@ def init_browser():
     setup_cookies(_ctx, auth)
     _pg = _ctx.pages[0] if _ctx.pages else _ctx.new_page()
 
+    # Block slow resources
+    try:
+        def _abort(route):
+            if route.request.resource_type in {"image", "font", "media"}:
+                route.abort()
+            else:
+                route.continue_()
+        _pg.route("**/*", _abort)
+    except Exception: pass
+
     _pg.goto(f"{MIMO_URL}/#/c", timeout=30000)
-    time.sleep(5)
+    try: _pg.wait_for_selector('textarea', timeout=10000)
+    except: time.sleep(4)
     
     # Check auth
     ta = _pg.locator("textarea").first

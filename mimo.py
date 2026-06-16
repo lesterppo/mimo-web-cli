@@ -42,7 +42,25 @@ def _mimo_server_running() -> bool:
 
 def _try_mimo_server(prompt: str, new_conv: bool = False) -> dict | None:
     if not _mimo_server_running():
-        return None
+        from pathlib import Path
+        server_script = Path(__file__).resolve().parent / "mimo_server.py"
+        if not server_script.exists():
+            return None
+        import subprocess
+        log_path = Path.home() / ".chrome-daemon" / "mimo_server.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(
+            [sys.executable, str(server_script)],
+            stdout=open(log_path, "a"), stderr=open(log_path, "a"),
+            start_new_session=True,
+        )
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if _mimo_server_running():
+                break
+            time.sleep(0.5)
+        if not _mimo_server_running():
+            return None
     try:
         import urllib.request
         data = json.dumps({"prompt": prompt}).encode()
