@@ -24,6 +24,10 @@ MIMO_MODEL_LABELS = {"mimo-v2.5-pro":"MiMo-V2.5-Pro","mimo-v2.5":"MiMo-V2.5","mi
 
 _Q = False
 
+class MimoError(Exception):
+    def __init__(self, code, msg):
+        self.code = code; self.msg = msg; super().__init__(msg)
+
 def fail(c,r): print(json.dumps({"ok":False,"err":c,"msg":r},ensure_ascii=False)); sys.exit(1)
 def log(m): print(m,file=sys.stderr,flush=True)
 def info(m):
@@ -56,27 +60,6 @@ def persist_auth(d):
     d["saved_at"]=datetime.now(timezone.utc).isoformat()
     MIMO_AUTH_FILE.write_text(json.dumps(d,indent=2))
 
-def extract_cookies_cross_platform(domain_hint: str) -> dict:
-    """Extract cookies using browser_cookie3 (cross-platform), with WSL Firefox fallback."""
-    try:
-        import browser_cookie3
-        for name, fetch_fn in [("chrome", browser_cookie3.chrome), ("firefox", browser_cookie3.firefox),
-                                ("edge", browser_cookie3.edge), ("chromium", browser_cookie3.chromium)]:
-            try:
-                cj = fetch_fn(domain_name=domain_hint)
-                cookies = {c.name: c.value for c in cj}
-                if cookies:
-                    info(f"Extracted {len(cookies)} cookies from {name}")
-                    return cookies
-            except Exception:
-                continue
-    except ImportError:
-        pass
-    result = extract_firefox_cookies()
-    if result: return result
-    return {}
-
-
 def get_auth():
     cs = os.environ.get("MIMO_COOKIE")
     if cs: return {"cookies":{k:v for p in cs.split("; ") if "=" in p for k,_,v in [p.partition("=")]}}
@@ -85,9 +68,9 @@ def get_auth():
             d = json.loads(MIMO_AUTH_FILE.read_text())
             if d.get("cookies"): return d
         except: pass
-    ck = extract_cookies_cross_platform("xiaomi.com")
+    ck = extract_firefox_cookies()
     if ck: d = {"cookies":ck}; persist_auth(d); return d
-    fail("no-auth","No Xiaomi cookies found. Log into https://aistudio.xiaomimimo.com in your browser first.")
+    fail("no-auth","No Xiaomi cookies found. Log into https://aistudio.xiaomimimo.com in Windows Firefox first.")
 
 def browser_login():
     from playwright.sync_api import sync_playwright
@@ -231,6 +214,15 @@ def send_prompt(pg, prompt, model=MIMO_DEFAULT_MODEL, thinking=True, conv_url=No
     time.sleep(5)
     dismiss_modals(pg); time.sleep(1)
     
+    # Early auth check — fails fast before trying to send
+    ta = pg.locator("textarea").first
+    if ta.count() > 0 and ta.is_visible(timeout=3000):
+        ph = ta.get_attribute("placeholder") or ""
+        if "sign in" in ph.lower():
+            raise MimoError("auth-expired",
+                "MiMo session expired. Log into https://aistudio.xiaomimimo.com in Windows Firefox, "
+                "then run: python mimo.py --login")
+    
     # Only switch model on first turn (conversation remembers model)
     if not conv_url and model != MIMO_DEFAULT_MODEL:
         switch_model(pg, model); time.sleep(1)
@@ -242,7 +234,7 @@ def send_prompt(pg, prompt, model=MIMO_DEFAULT_MODEL, thinking=True, conv_url=No
 
     ta = pg.locator("textarea").first
     if ta.count()==0 or not ta.is_visible(timeout=8000):
-        fail("no-input","Chat input not found. Auth may be expired.")
+        raise MimoError("no-input","Chat input not found. Auth may be expired.")
     if debug: info(f"Sending ({len(prompt)} chars)")
     ta.fill(prompt); time.sleep(0.5); ta.press("Enter")
     time.sleep(1)
@@ -255,9 +247,9 @@ def send_prompt(pg, prompt, model=MIMO_DEFAULT_MODEL, thinking=True, conv_url=No
     while time.time() < deadline:
         try:
             e = pg.evaluate(ERROR_JS)
-            if e=="auth-expired": fail("auth-expired","Auth expired. Re-login.")
-            elif e=="error": fail("mimo-error","MiMo error.")
-            elif e=="rate-limit": fail("rate-limit","Rate limited.")
+            if e=="auth-expired": raise MimoError("auth-expired","Auth expired. Re-login.")
+            elif e=="error": raise MimoError("mimo-error","MiMo error.")
+            elif e=="rate-limit": raise MimoError("rate-limit","Rate limited.")
         except: pass
         
         # Check if body has grown (new response generated)
@@ -308,28 +300,53 @@ def main():
     if conv.get("model") and model == MIMO_DEFAULT_MODEL: model = conv["model"]
     conv_url = conv.get("url") if not args.new else None
 
+    # Suppress Node.js v24 EPIPE crashes during Playwright shutdown
+    # Node v24 throws on unhandled 'error' events on streams
+    env = os.environ.copy()
+    env.setdefault("NODE_NO_WARNINGS", "1")
+    
     auth = get_auth()
+    br = ctx = pg = None
     try:
         from playwright.sync_api import sync_playwright
-        with sync_playwright() as pw:
-            br = pw.chromium.launch(headless=True,args=["--no-sandbox","--disable-gpu"])
+        pw = sync_playwright().start()
+        try:
+            br = pw.chromium.launch(headless=True,
+                args=["--no-sandbox","--disable-gpu","--disable-dev-shm-usage"])
             ctx = br.new_context(viewport={"width":1280,"height":800})
             setup_cookies(ctx,auth)
             pg = ctx.pages[0] if ctx.pages else ctx.new_page()
             text, url = send_prompt(pg, prompt, model=model, thinking=thinking,
                                     conv_url=conv_url, debug=args.debug)
-            ctx.close(); br.close()
-            if not text: fail("empty-response","No response.")
-            log("[MIMO:DONE]")
-            if args.conversation:
-                conv["url"]=url; conv["model"]=model
-                save_conv(args.conversation, conv)
-            if args.output:
-                op = Path(args.output); op.write_text(text,encoding="utf-8")
-                # Token-efficient: return tiny JSON pointer
-                print(json.dumps({"f":str(op),"s":op.stat().st_size,"b":text.count("```")//2},ensure_ascii=False))
-            elif args.json: print(json.dumps({"ok":True,"text":text,"url":url,"model":model},ensure_ascii=False))
-            else: print(text)
+        finally:
+            # Close in reverse order — context before browser
+            # Wrap each close in try/except to survive Node.js pipe errors
+            if pg: 
+                try: pg.close()
+                except: pass
+            if ctx: 
+                try: ctx.close()
+                except: pass
+            if br: 
+                try: br.close()
+                except: pass
+            try: pw.stop()
+            except: pass
+        
+        if not text: raise MimoError("empty-response","No response.")
+        log("[MIMO:DONE]")
+        if args.conversation:
+            conv["url"]=url; conv["model"]=model
+            save_conv(args.conversation, conv)
+        if args.output:
+            op = Path(args.output); op.write_text(text,encoding="utf-8")
+            # Token-efficient: return tiny JSON pointer
+            print(json.dumps({"f":str(op),"s":op.stat().st_size,"b":text.count("```")//2},ensure_ascii=False))
+        elif args.json: print(json.dumps({"ok":True,"text":text,"url":url,"model":model},ensure_ascii=False))
+        else: print(text)
+    except MimoError as e:
+        print(json.dumps({"ok":False,"err":e.code,"msg":e.msg},ensure_ascii=False))
+        sys.exit(1)
     except SystemExit: raise
     except Exception as e: fail("error",str(e))
 
