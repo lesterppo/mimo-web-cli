@@ -24,6 +24,40 @@ MIMO_MODEL_LABELS = {"mimo-v2.5-pro":"MiMo-V2.5-Pro","mimo-v2.5":"MiMo-V2.5","mi
 
 _Q = False
 
+# Page server integration
+_MIMO_SERVER_PORT = 9872
+_MIMO_PID_FILE = MIMO_HOME / "server.pid"
+
+def _mimo_server_running() -> bool:
+    if not _MIMO_PID_FILE.exists():
+        return False
+    try:
+        pid = int(_MIMO_PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        import urllib.request
+        urllib.request.urlopen(f"http://127.0.0.1:{_MIMO_SERVER_PORT}/health", timeout=1)
+        return True
+    except Exception:
+        return False
+
+def _try_mimo_server(prompt: str, new_conv: bool = False) -> dict | None:
+    if not _mimo_server_running():
+        return None
+    try:
+        import urllib.request
+        data = json.dumps({"prompt": prompt}).encode()
+        path = "/query/new" if new_conv else "/query"
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{_MIMO_SERVER_PORT}{path}",
+            data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+            if result.get("ok"):
+                return result
+    except Exception:
+        pass
+    return None
+
 class MimoError(Exception):
     def __init__(self, code, msg):
         self.code = code; self.msg = msg; super().__init__(msg)
@@ -108,7 +142,6 @@ def save_conv(p,s):
 EXTRACT_JS = """
 () => {
     // Get the response from the LAST "Thought for Xs" block
-    // (in multi-turn, each turn has its own "Thought for" block)
     const body = document.body.innerText;
     const footerIdx = body.indexOf('Developer demo platform');
     if (footerIdx < 0) return '';
@@ -121,7 +154,22 @@ EXTRACT_JS = """
     const thoughtIdx = lastThought.index + lastThought[0].length;
     const afterThought = beforeFooter.substring(thoughtIdx);
     
-    const lines = afterThought.split('\\n').map(l => l.trim()).filter(l => l && !l.startsWith('MiMo') && !l.startsWith('MiMo-'));
+    const lines = afterThought.split('\\n').map(l => l.trim()).filter(l => {
+        if (!l) return false;
+        if (l.startsWith('MiMo') || l.startsWith('MiMo-')) return false;
+        // Filter out cookie consent and marketing UI chrome
+        if (l.startsWith('We use cookies')) return false;
+        if (l.startsWith('Cookie')) return false;
+        if (l.includes('Accept All') || l.includes('Decline All')) return false;
+        if (l.startsWith('Citation sources')) return false;
+        if (l.startsWith('Flagship Model') || l.startsWith('Kingsoft')) return false;
+        if (l.startsWith('Flexible Subscription') || l.startsWith('Daily free')) return false;
+        if (l.startsWith('TokenPlan') || l.startsWith('Try Now')) return false;
+        if (l.startsWith('API Service')) return false;
+        if (l.includes('Cookie Policy') || l.includes('Cookie Setting')) return false;
+        if (l.startsWith('Learn More')) return false;
+        return true;
+    });
     return lines.join('\\n').trim();
 }
 """
@@ -312,6 +360,23 @@ def main():
     prompt = args.prompt_flag or (" ".join(args.prompt) if args.prompt else None)
     if not prompt and not sys.stdin.isatty(): prompt = sys.stdin.read().strip()
     if not prompt: p.print_help(); sys.exit(1)
+
+    # Fast path: try page server first (avoids Node.js v24 EPIPE in subprocess)
+    model = args.model
+    server_result = _try_mimo_server(prompt, new_conv=args.new)
+    if server_result:
+        text = server_result.get("text", "")
+        if not text: raise MimoError("empty-response", "No response from server.")
+        log("[MIMO:DONE]")
+        if args.conversation:
+            conv["url"] = "server"; conv["model"] = model
+            save_conv(args.conversation, conv)
+        if args.output:
+            op = Path(args.output); op.write_text(text, encoding="utf-8")
+            print(json.dumps({"f":str(op),"s":op.stat().st_size,"b":text.count("```")//2}, ensure_ascii=False))
+        elif args.json: print(json.dumps({"ok":True,"text":text,"model":model}, ensure_ascii=False))
+        else: print(text)
+        return
 
     model = args.model; thinking = not args.no_thinking
     conv = load_conv(args.conversation) if args.conversation else {}
