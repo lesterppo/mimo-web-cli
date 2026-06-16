@@ -204,17 +204,39 @@ def toggle_thinking(pg, thinking: bool):
         # MiMo-V2.5-Pro has thinking on by default — clicking the model button area
     except: pass
 
+def _block_slow(pg):
+    """Block images, fonts, media for faster page load."""
+    try:
+        def _abort_slow(route):
+            if route.request.resource_type in {"image", "font", "media"}:
+                route.abort()
+            else:
+                route.continue_()
+        pg.route("**/*", _abort_slow)
+    except Exception:
+        pass
+
 def send_prompt(pg, prompt, model=MIMO_DEFAULT_MODEL, thinking=True, conv_url=None, debug=False):
     log("[MIMO:LOADING]")
+    
+    # Block slow resources for faster page load
+    _block_slow(pg)
+    
     # Navigate to conversation URL if continuing, otherwise new chat
     if conv_url:
         pg.goto(conv_url, wait_until="domcontentloaded", timeout=30000)
     else:
         pg.goto(f"{MIMO_BASE_URL}/#/c", wait_until="domcontentloaded", timeout=30000)
-    time.sleep(5)
-    dismiss_modals(pg); time.sleep(1)
     
-    # Early auth check — fails fast before trying to send
+    # Smart wait: wait for textarea instead of fixed sleep(5)
+    try:
+        pg.wait_for_selector('textarea', timeout=10000)
+    except Exception:
+        time.sleep(4)  # Fallback
+    
+    dismiss_modals(pg); time.sleep(0.3)
+    
+    # Early auth check
     ta = pg.locator("textarea").first
     if ta.count() > 0 and ta.is_visible(timeout=3000):
         ph = ta.get_attribute("placeholder") or ""
@@ -223,23 +245,21 @@ def send_prompt(pg, prompt, model=MIMO_DEFAULT_MODEL, thinking=True, conv_url=No
                 "MiMo session expired. Log into https://aistudio.xiaomimimo.com in Windows Firefox, "
                 "then run: python mimo.py --login")
     
-    # Only switch model on first turn (conversation remembers model)
+    # Only switch model on first turn
     if not conv_url and model != MIMO_DEFAULT_MODEL:
-        switch_model(pg, model); time.sleep(1)
-        # Model switch may reload page — re-dismiss modals
-        dismiss_modals(pg); time.sleep(2)
+        switch_model(pg, model); time.sleep(0.5)
+        dismiss_modals(pg); time.sleep(0.5)
     
     toggle_thinking(pg, thinking)
-    time.sleep(1)
+    time.sleep(0.3)
 
     ta = pg.locator("textarea").first
     if ta.count()==0 or not ta.is_visible(timeout=8000):
         raise MimoError("no-input","Chat input not found. Auth may be expired.")
     if debug: info(f"Sending ({len(prompt)} chars)")
-    ta.fill(prompt); time.sleep(0.5); ta.press("Enter")
-    time.sleep(1)
+    ta.fill(prompt); time.sleep(0.2); ta.press("Enter")
 
-    # Record body length before response starts generating
+    # Poll for response (0.5s intervals)
     pre_len = len(pg.locator("body").inner_text())
     text = ""; deadline = time.time() + 300
     consecutive_stable = 0
@@ -250,9 +270,9 @@ def send_prompt(pg, prompt, model=MIMO_DEFAULT_MODEL, thinking=True, conv_url=No
             if e=="auth-expired": raise MimoError("auth-expired","Auth expired. Re-login.")
             elif e=="error": raise MimoError("mimo-error","MiMo error.")
             elif e=="rate-limit": raise MimoError("rate-limit","Rate limited.")
-        except: pass
+        except MimoError: raise
+        except Exception: pass
         
-        # Check if body has grown (new response generated)
         current_len = len(pg.locator("body").inner_text())
         if current_len > last_len:
             last_len = current_len
@@ -260,13 +280,13 @@ def send_prompt(pg, prompt, model=MIMO_DEFAULT_MODEL, thinking=True, conv_url=No
         else:
             consecutive_stable += 1
         
-        # Body has grown past initial AND stabilized (3s no growth)
-        if current_len > pre_len + 50 and consecutive_stable >= 3:
+        # Body has grown past initial AND stabilized (3s no growth → 6 cycles at 0.5s)
+        if current_len > pre_len + 50 and consecutive_stable >= 6:
             try: text = pg.evaluate(EXTRACT_JS)
             except: text = ""
             if text and len(text) > 2:
                 break
-        time.sleep(1)
+        time.sleep(0.5)
     # Strip user prompt if it appears at the start of the response
     if text.startswith(prompt):
         text = text[len(prompt):].strip()
