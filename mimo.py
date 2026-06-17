@@ -330,6 +330,8 @@ def send_prompt(pg, prompt, model=MIMO_DEFAULT_MODEL, thinking=True, conv_url=No
     text = ""; deadline = time.time() + 300
     consecutive_stable = 0
     last_len = pre_len
+    text_stable_count = 0
+    last_text_len = 0
     while time.time() < deadline:
         try:
             e = pg.evaluate(ERROR_JS)
@@ -351,7 +353,16 @@ def send_prompt(pg, prompt, model=MIMO_DEFAULT_MODEL, thinking=True, conv_url=No
             try: text = pg.evaluate(EXTRACT_JS)
             except: text = ""
             if text and len(text) > 2:
-                break
+                # Don't break immediately — MiMo's DOM text nodes lag behind
+                # body.innerText settling. Wait for extracted text to stabilize.
+                cur_text_len = len(text)
+                if cur_text_len == last_text_len and cur_text_len > 0:
+                    text_stable_count += 1
+                    if text_stable_count >= 6:  # ~3s of stable extracted text
+                        break
+                else:
+                    last_text_len = cur_text_len
+                    text_stable_count = 1
         time.sleep(0.5)
     # Strip user prompt if it appears at the start of the response
     if text.startswith(prompt):

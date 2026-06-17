@@ -113,11 +113,11 @@ def send_query(prompt: str, new_conversation: bool = False) -> str:
     # Wait for response
     deadline = time.time() + 120
     pre_len = len(_pg.locator("body").inner_text())
+    last_text = ""
+    stable_count = 0
     while time.time() < deadline:
         body = _pg.locator("body").inner_text()
         if "Thought for" in body and len(body) > pre_len + 30:
-            time.sleep(2)
-            body = _pg.locator("body").inner_text()
             parts = body.split("Thought for")
             if len(parts) > 1:
                 last = parts[-1]
@@ -138,7 +138,16 @@ def send_query(prompt: str, new_conversation: bool = False) -> str:
                             break
                         if not s.startswith("MiMo"):
                             result.append(s)
-                return "\n".join(result).strip()
+                current = "\n".join(result).strip()
+                # Wait for extracted text to stabilize — MiMo's DOM
+                # text nodes lag behind body.innerText availability
+                if current and len(current) == len(last_text):
+                    stable_count += 1
+                    if stable_count >= 6:  # ~3s of stable extracted text
+                        return current
+                else:
+                    last_text = current
+                    stable_count = 1
         time.sleep(0.5)
     return ""
 
